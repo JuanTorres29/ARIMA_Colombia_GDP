@@ -1,0 +1,260 @@
+---
+title: "Modelado ARIMA para el PIB de Colombia (1960 - 2023)"
+author: "Juan Andrés Torres Contreras"
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+date: "2025-03-17"
+---
+
+```{r}
+library(FinTS) 
+library(forecast)
+library(TSA)
+library(tseries)
+library(dplyr)
+library(lmtest)
+library(MASS)
+```
+
+# Contexto inicial  
+
+Este análisis se basa en la serie temporal del Producto Interno Bruto (PIB) de Colombia, medida en dólares estadounidenses a precios constantes de 2015. Los datos fueron extraídos del Banco Mundial y abarcan el período de 1960 a 2023.  
+
+### Fuente de los datos  
+Los datos provienen de las cuentas nacionales del Banco Mundial y de los archivos de datos de Cuentas Nacionales de la OCDE.  
+
+### Unidades de medida  
+El PIB está expresado en dólares estadounidenses constantes de 2015, lo que permite eliminar los efectos de la inflación y facilita comparaciones a lo largo del tiempo. La metodología utilizada convierte las cifras de PIB a partir de monedas nacionales utilizando los tipos de cambio oficiales de 2015. En algunos casos, se aplica un factor de conversión alternativo si el tipo de cambio oficial no refleja las transacciones reales de divisas.  
+
+### Definición del indicador  
+Según la metadata, el PIB a precios de comprador se define como la suma del valor agregado bruto de todos los productores residentes en la economía, más los impuestos sobre los productos y menos los subsidios no incluidos en el valor de los productos. No se hacen deducciones por depreciación de activos ni por agotamiento de recursos naturales.  
+
+
+## Serie sin Transformar
+```{r}
+library(readr)
+df <- read_csv("API_NY.GDP.MKTP.KD_DS2_es_csv_v2_8100.csv", 
+    skip = 4)
+
+print(df)
+```
+
+```{r}
+# Filtramos solo los datos de Colombia
+df_colombia <- df %>% filter(`Country Code` == "COL")
+print(df_colombia)
+```
+
+```{r}
+# Seleccionamos solo los datos de la serie
+df_colombia <- df_colombia %>% dplyr::select(-`Country Name`, -`Country Code`, -`Indicator Name`, -`Indicator Code`)
+
+# Asegurar que df_colombia contiene solo los valores de los años
+valores_pib <- as.numeric(unlist(df_colombia))
+
+# Crear la serie temporal desde 1960 hasta 2003 con frecuencia anual
+ts_colombia <- ts(valores_pib, start = 1960, end = 2023, frequency = 1)
+
+# Verificar que la serie temporal se creó correctamente
+print(ts_colombia)
+
+```
+
+```{r}
+# Graficamos la serie para visualizarla
+plot(ts_colombia, main = "PIB de Colombia (1960-2023)", ylab = "PIB en US$ (constantes de 2015)", xlab = "Año", lwd=2, col = "blue")
+```
+
+La serie muestra una clara tendencia creciente en el PIB de Colombia desde 1960 hasta 2023. A simple vista, se puede observar un crecimiento acelerado a partir de los años 2000, con ciertas desaceleraciones y pequeñas caídas en algunos periodos.
+
+### Tendencias y anomalías
+
+- Desde 1960 hasta finales de los 90, el PIB crece de forma sostenida con ligeras variaciones.  
+- A partir del 2000, el crecimiento se vuelve más pronunciado.  
+- Se observa una caída notable alrededor de 2020, probablemente asociada al impacto económico de la pandemia de COVID-19, seguida de una rápida recuperación en los años posteriores.  
+
+### Estacionalidad y estacionariedad
+
+- No se observa estacionalidad evidente, lo que es esperable en una serie de PIB anual.  
+- La serie no es estacionaria, ya que presenta una tendencia clara de crecimiento en el tiempo. Para aplicar modelos ARMA o ARIMA, será necesario transformar la serie para hacerla estacionaria.  
+
+## Transformación logarítmica y diferenciación de la serie
+
+```{r}
+# Aplicamos logaritmo natural a la serie
+log_ts_colombia <- log(ts_colombia)
+
+# Graficamos la serie transformada
+plot(log_ts_colombia, main = "Log del PIB de Colombia", 
+     ylab = "Log(PIB en US$ constantes de 2015)", xlab = "Año")
+
+# Diferenciamos la serie logarítmica para hacerla estacionaria
+diff_log_ts_colombia <- diff(log_ts_colombia)
+
+# Graficamos la serie diferenciada
+plot(diff_log_ts_colombia, main = "Diferencia del Log(PIB) de Colombia", 
+     ylab = "Cambio en Log(PIB)", xlab = "Año")
+
+# Verificamos estacionariedad con prueba de Dickey-Fuller
+adf.test(diff_log_ts_colombia)
+
+```
+
+Para estabilizar la varianza y facilitar el modelado, se aplicó el logaritmo natural a la serie de tiempo del PIB. Posteriormente, se realizó una diferenciación de primer orden para eliminar la tendencia y hacer la serie estacionaria.
+
+### Prueba de Dickey-Fuller Aumentada (ADF)
+
+La prueba ADF se utilizó para evaluar la estacionariedad de la serie diferenciada. Esta prueba contrasta la hipótesis nula de que la serie tiene una raíz unitaria (es decir, no es estacionaria) contra la alternativa de que es estacionaria.
+
+#### Resultado de la prueba:
+
+Dado que el **p-valor es 0.02368**, menor al umbral típico de **0.05**, se rechaza la hipótesis nula, indicando que la serie diferenciada en logaritmos es estacionaria.
+
+```{r}
+# Graficamos ACF y PACF de la serie diferenciada en logaritmos
+
+par(mfrow = c(2,1))  # Para mostrar ambas gráficas juntas
+
+acf(diff_log_ts_colombia, main = "ACF del PIB Diferenciado en Log")
+axis(1, at = seq(0, 30, by = 1), labels = seq(0, 30, by = 1))
+pacf(diff_log_ts_colombia, main = "PACF del PIB Diferenciado en Log")
+axis(1, at = seq(0, 30, by = 1), labels = seq(0, 30, by = 1))
+```
+
+De acuerdo a las gráficas ACF y PACF, no existe una autocorrelación significativa bajo ningún rezago. Esto puede ser debido a la influencia de los valores atípicos de la serie en la pandemia.
+
+Para mitigar el impacto de valores atípicos en la identificación de p y q, aplicaremos un preprocesamiento temporal a la serie diferenciada del logaritmo del PIB de Colombia, utilizando tsoutliers, que permitirá identificar posibles observaciones extremas que podrían distorsionar el análisis. Luego, se aplicará tsclean, para corregir la serie, reemplazando estos valores con estimaciones interpoladas y suavizando su comportamiento sin alterar la estructura subyacente. 
+
+```{r}
+outliers <- tsoutliers(diff_log_ts_colombia)
+ts_colombia_clean <- tsclean(diff_log_ts_colombia)
+
+print(outliers)
+
+# Graficamos la serie diferenciada
+plot(ts_colombia_clean, main = "Diferencia del Log(PIB) de Colombia (tsclean)", 
+     ylab = "Cambio en Log(PIB)", xlab = "Año")
+```
+
+Se observa que los datos que cambian son solamente los de 2020 y 2021, por lo que la correción de los datos atípicos generados en la pandemia es exitosa.
+
+```{r}
+# Graficamos ACF y PACF de la serie diferenciada en logaritmos
+
+par(mfrow = c(2,1))  # Para mostrar ambas gráficas juntas
+
+acf(ts_colombia_clean, main = "ACF del PIB Diferenciado en Log (tsclean)")
+axis(1, at = seq(0, 30, by = 1), labels = seq(0, 30, by = 1))
+pacf(ts_colombia_clean, main = "PACF del PIB Diferenciado en Log (tsclean)")
+axis(1, at = seq(0, 30, by = 1), labels = seq(0, 30, by = 1))
+```
+
+Tras aplicar la corrección, se identifica un modelo ARMA(1,1) como la mejor representación de la estructura temporal de la serie. 
+
+# Modelo ARIMA(1,1,1)
+
+```{r}
+modelo_arma <- Arima(log_ts_colombia, order = c(1,1,1))
+summary(modelo_arma)
+```
+Para evaluar si este es el modelo más adecuado, compararemos sus criterios de información con los obtenidos mediante la función auto.arima(). Esto nos permitirá determinar si el modelo seleccionado manualmente ofrece un mejor ajuste en términos de AIC y BIC.
+
+```{r}
+# Modelo óptimo según auto.arima()
+modelo_auto <- auto.arima(log_ts_colombia)
+
+summary(modelo_auto)
+```
+
+El modelo seleccionado por auto.arima() fue un ARIMA(0,1,0) con drift, lo que indica que la mejor opción sin considerar regresores externos es un modelo de paseo aleatorio con tendencia. Esto se ve reflejado en los criterios de información, donde obtuvo un AIC de -276.46, mejor que el del modelo ARMA(1,1) considerado anteriormente.
+
+Dado que este modelo no incluye términos AR ni MA, exploraremos la posibilidad de mejorar la especificación incorporando una variable externa que capture el impacto de la pandemia en la serie. Para ello, construiremos un modelo ARIMA(1,1,1) con un regresor indicador para el período posterior a 2020. Esto permitirá evaluar si la inclusión de esta variable mejora el ajuste del modelo y proporciona una mejor interpretación de los efectos de la pandemia en la serie.
+
+# Modelo ARIMA(1,1,1) con xreg
+
+
+```{r}
+años <- as.numeric(colnames(df_colombia))  
+años <- na.omit(años)
+pandemia <- ifelse(años >= 2020, 1, 0)
+
+# Ajustamos modelo ARIMA con regresor externo
+modelo_arma_xreg <- Arima(log(ts_colombia), order = c(1,1,1), xreg = pandemia)
+summary(modelo_arma_xreg)
+```
+
+El modelo ARIMA(1,1,1) con regresor externo presenta una mejora significativa respecto al ARIMA(0,1,0), dado que su criterio de información AIC (-292.59) es menor que el del modelo sin regresores (-276.46). Esto indica que la inclusión de la variable externa ha permitido capturar mejor la dinámica de la serie, logrando un mejor balance entre ajuste y complejidad del modelo.
+
+En cuanto a los coeficientes, el componente autoregresivo (AR1) es alto (0.9235), lo que sugiere una fuerte dependencia temporal en la serie. El término de media móvil (MA1) es negativo (-0.2264), pero con mayor incertidumbre, lo que indica una corrección más leve de los choques pasados. El regresor externo tiene un coeficiente de -0.1350, lo que sugiere que la variable incluida tiene un impacto significativo en la serie.
+
+Las métricas de error también reflejan una mejora con respecto al modelo anterior. El RMSE (0.0220), el MAE (0.0173) y el MAPE (0.0677) son menores, lo que indica una mejor precisión en las predicciones.
+
+
+#### Ecuación del modelo:
+
+$$
+\nabla \log(y_t) = \phi_1 \nabla \log(y_{t-1}) + \theta_1 \varepsilon_{t-1} + \beta \cdot \text{pandemia} + \varepsilon_t
+$$
+
+
+$$
+\nabla \log(y_t) = 0.9235 \nabla \log(y_{t-1}) - 0.2264 \varepsilon_{t-1} - 0.1350 \cdot \text{pandemia} + \varepsilon_t
+$$
+
+
+
+# Análisis de Residuos
+
+```{r}
+residuals_arma <- residuals(modelo_arma_xreg)
+plot(residuals_arma, main = "Residuos del Modelo ARMA(2,1)", ylab = "Residuos", xlab = "Tiempo")
+```
+
+#### Prueba de Normalidad: Jarque - Bera
+
+```{r}
+jarque.bera.test(residuals_arma)
+```
+
+```{r}
+qqnorm(residuals_arma); qqline(residuals_arma, col = "red")
+boxplot(residuals_arma, main = "Boxplot de Residuos", horizontal = TRUE)
+```
+
+El p-valor de 0.1894 y el qqplot indican que no hay evidencia suficiente para rechazar la hipótesis nula de normalidad. Esto sugiere que los residuos transformados siguen una distribución normal.
+
+#### Prueba de Homocedasticidad: ARCH
+
+
+```{r}
+ArchTest(residuals_arma, lags = 5)
+```
+
+El p-valor de 0.3883 indica que no hay evidencia suficiente para rechazar la hipótesis nula, por lo que no se detectan efectos ARCH en los residuos. Esto sugiere que la varianza es constante en el tiempo.
+
+#### Prueba de Correlacion Serial: Ljung-Box
+
+```{r}
+Box.test(residuals_arma, lag = 10, type = "Ljung-Box")
+```
+
+```{r}
+tsdiag(modelo_arma_xreg)
+```
+
+
+El p-valor de 0.2109 indica que no hay evidencia suficiente para rechazar la hipótesis nula de ausencia de autocorrelación en los residuos, lo cuál se confirma con las gráficas. Esto sugiere que los residuos no presentan una estructura de correlación significativa.
+
+
+# Conclusiones
+
+El modelo final seleccionado para representar la dinámica del PIB de Colombia fue un ARIMA(1,1,1) con un regresor externo, el cual ofreció un mejor ajuste en comparación con el modelo sin regresores. La inclusión de una variable indicadora para la pandemia permitió capturar mejor las fluctuaciones en la serie, reflejándose en una reducción del AIC y en una mejora de las métricas de error.
+
+Los coeficientes estimados muestran que el componente autoregresivo es fuerte, lo que indica una alta persistencia en los valores del PIB, mientras que el término de media móvil tiene un impacto menor en la serie. Además, el coeficiente del regresor externo resultó significativo, confirmando que la pandemia tuvo un efecto relevante en la evolución del PIB.
+
+Las pruebas de diagnóstico confirmaron que los residuos cumplen con los supuestos de normalidad, homocedasticidad y ausencia de autocorrelación, validando la adecuación del modelo. Con este ajuste, se logra una representación confiable de la evolución del PIB de Colombia en el periodo analizado.
+
+
+
